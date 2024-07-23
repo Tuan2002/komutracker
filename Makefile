@@ -1,20 +1,38 @@
 # =====================================
-# Makefile for the KomuTracker bundle
+# Makefile for the ActivityWatch bundle
 # =====================================
 #
 # [GUIDE] How to install from source:
-#  - https://komutracker.readthedocs.io/en/latest/installing-from-source.html
+#  - https://activitywatch.readthedocs.io/en/latest/installing-from-source.html
 #
 # We recommend creating and activating a Python virtualenv before building.
 # Instructions on how to do this can be found in the guide linked above.
-
-# These targets should always rerun
 .PHONY: build install test clean clean_all
 
-SKIP_SERVER_PYTHON := 1   # Skip building the server Python
-SKIP_SERVER_RUST := 1     # Skip building the server Rust
-
 SHELL := /usr/bin/env bash
+
+SUBMODULES := aw-core aw-client aw-qt aw-server aw-watcher-afk aw-watcher-window
+
+# Exclude aw-server-rust if SKIP_SERVER_RUST is true
+ifeq ($(SKIP_SERVER_RUST),true)
+	SUBMODULES := $(filter-out aw-server-rust,$(SUBMODULES))
+endif
+# Include extras if AW_EXTRAS is true
+ifeq ($(AW_EXTRAS),true)
+	SUBMODULES := $(SUBMODULES) aw-notify aw-watcher-input
+endif
+
+# A function that checks if a target exists in a Makefile
+# Usage: $(call has_target,<dir>,<target>)
+define has_target
+$(shell make -q -C $1 $2 >/dev/null 2>&1; if [ $$? -eq 0 -o $$? -eq 1 ]; then echo $1; fi)
+endef
+
+# Submodules with test/package/lint/typecheck targets
+TESTABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),test))
+PACKAGEABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),package))
+LINTABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),lint))
+TYPECHECKABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),typecheck))
 
 # The `build` target
 # ------------------
@@ -22,30 +40,27 @@ SHELL := /usr/bin/env bash
 # What it does:
 #  - Installs all the Python modules
 #  - Builds the web UI and bundles it with aw-server
-#
-# Tips:
-#  - Set the environment variable `PIP_USER=true` for pip to install all Python
-#    packages as user packages (same as `pip install --user <pkg>`). This makes
-#    it possible to install without using a virtualenv (or root).
-build:
-	if [ -e "aw-core/.git" ]; then \
-		echo "Submodules seem to already be initialized, continuing..."; \
-	else \
-		git submodule update --init --recursive; \
-	fi
-#
+build: aw-core/.git
 #	needed due to https://github.com/pypa/setuptools/issues/1963
 #	would ordinarily be specified in pyproject.toml, but is not respected due to https://github.com/pypa/setuptools/issues/1963
 	pip install 'setuptools>49.1.1'
-#
-	make --directory=aw-core build
+	@if [ "$(SKIP_SERVER_RUST)" = "false" ]; then \
+		if (which cargo); then \
+			echo 'Rust found!'; \
+		else \
+			echo 'ERROR: Rust not found, try running with SKIP_SERVER_RUST=true'; \
+			exit 1; \
+		fi \
+	fi
+	for module in $(SUBMODULES); do \
+		echo "Building $$module"; \
+		make --directory=$$module build SKIP_WEBUI=$(SKIP_WEBUI) || { echo "Error in $$module build"; exit 2; }; \
+	done
+#   The below is needed due to: https://github.com/ActivityWatch/activitywatch/issues/173
 	make --directory=aw-client build
-	make --directory=aw-watcher-afk build
-	make --directory=aw-watcher-window build
-	make --directory=aw-qt build
-#   The below is needed due to: https://github.com/nccasia/komutracker/issues/173
-	make --directory=aw-client build
 	make --directory=aw-core build
+#	Needed to ensure that the server has the correct version set
+	python -c "import aw_server; print(aw_server.__version__)"
 
 
 # Install
@@ -70,15 +85,16 @@ update:
 
 
 lint:
-	pylint -E \
-		aw-core/aw_core/ \
-		aw-core/aw_datastore/ \
-		aw-core/aw_transform/ \
-		aw-core/aw_analysis/ \
-		aw-client/aw_client/ \
-		aw-watcher-window/aw_watcher_window/ \
-		aw-watcher-afk/aw_watcher_afk/ \
-		aw-qt/aw_qt/
+	@for module in $(LINTABLES); do \
+		echo "Linting $$module"; \
+		make --directory=$$module lint || { echo "Error in $$module lint"; exit 2; }; \
+	done
+
+typecheck:
+	@for module in $(TYPECHECKABLES); do \
+		echo "Typechecking $$module"; \
+		make --directory=$$module typecheck || { echo "Error in $$module typecheck"; exit 2; }; \
+	done
 
 # Uninstall
 # ---------
@@ -92,15 +108,21 @@ uninstall:
 	done
 
 test:
-	make --directory=aw-core test
-	make --directory=aw-client test
-	make --directory=aw-qt test
+	@for module in $(TESTABLES); do \
+		echo "Running tests for $$module"; \
+		poetry run make -C $$module test || { echo "Error in $$module tests"; exit 2; }; \
+    done
 
 test-integration:
 	# TODO: Move "integration tests" to aw-client
 	# FIXME: For whatever reason the script stalls on Appveyor
-	#        Example: https://ci.appveyor.com/project/ErikBjare/komutracker/build/1.0.167/job/k1ulexsc5ar5uv4v
-	#pytest ./scripts/tests/integration_tests.py ./aw-server/tests/ -v
+	#        Example: https://ci.appveyor.com/project/ErikBjare/activitywatch/build/1.0.167/job/k1ulexsc5ar5uv4v
+	# aw-server-python
+	@echo "== Integration testing aw-server =="
+	@pytest ./scripts/tests/integration_tests.py ./aw-server/tests/ -v
+
+%/.git:
+	git submodule update --init --recursive
 
 ICON := "aw-qt/media/logo/logo.png"
 
@@ -120,47 +142,38 @@ aw-qt/media/logo/logo.icns:
 	rm -R build/MyIcon.iconset
 	mv build/MyIcon.icns aw-qt/media/logo/logo.icns
 
-dist/KomuTracker.app: aw-qt/media/logo/logo.icns
-	pyinstaller --clean --noconfirm --windowed aw.spec
+dist/ActivityWatch.app: aw-qt/media/logo/logo.icns
+	pyinstaller --clean --noconfirm aw.spec
 
-dist/KomuTracker.dmg: dist/KomuTracker.app
+dist/ActivityWatch.dmg: dist/ActivityWatch.app
 	# NOTE: This does not codesign the dmg, that is done in the CI config
 	pip install dmgbuild
-	dmgbuild -s scripts/package/dmgbuild-settings.py -D app=dist/KomuTracker.app "KomuTracker" dist/KomuTracker.dmg
+	dmgbuild -s scripts/package/dmgbuild-settings.py -D app=dist/ActivityWatch.app "ActivityWatch" dist/ActivityWatch.dmg
 
 dist/notarize:
 	./scripts/notarize.sh
 
 package:
-	mkdir -p dist/komutracker
-#
-	make --directory=aw-watcher-afk package
-	cp -r aw-watcher-afk/dist/aw-watcher-afk dist/komutracker
-#
-	make --directory=aw-watcher-window package
-	cp -r aw-watcher-window/dist/aw-watcher-window dist/komutracker
-#
-ifndef SKIP_SERVER_PYTHON
-	make --directory=aw-server package
-	cp -r aw-server/dist/aw-server dist/komutracker
-endif	
-ifndef SKIP_SERVER_RUST
-	make --directory=aw-server-rust package
-	mkdir -p dist/komutracker/aw-server-rust
-	cp -r aw-server-rust/target/package/* dist/komutracker/aw-server-rust
-endif
-	make --directory=aw-qt package
-	cp -r aw-qt/dist/aw-qt/. dist/komutracker
+	rm -rf dist
+	mkdir -p dist/activitywatch
+	for dir in $(PACKAGEABLES); do \
+		make --directory=$$dir package; \
+		cp -r $$dir/dist/$$dir dist/activitywatch; \
+	done
+# Move aw-qt to the root of the dist folder
+	mv dist/activitywatch/aw-qt aw-qt-tmp
+	mv aw-qt-tmp/* dist/activitywatch
+	rmdir aw-qt-tmp
 # Remove problem-causing binaries
-	rm -f dist/komutracker/libdrm.so.2       # see: https://github.com/nccasia/komutracker/issues/161
-	rm -f dist/komutracker/libharfbuzz.so.0  # see: https://github.com/nccasia/komutracker/issues/660#issuecomment-959889230
+	rm -f dist/activitywatch/libdrm.so.2       # see: https://github.com/ActivityWatch/activitywatch/issues/161
+	rm -f dist/activitywatch/libharfbuzz.so.0  # see: https://github.com/ActivityWatch/activitywatch/issues/660#issuecomment-959889230
 # These should be provided by the distro itself
-# Had to be removed due to otherwise causing the error: 
-#   aw-qt: symbol lookup error: /opt/komutracker/libQt5XcbQpa.so.5: undefined symbol: FT_Get_Font_Format
-	rm -f dist/komutracker/libfontconfig.so.1
-	rm -f dist/komutracker/libfreetype.so.6
-# Remove unecessary files
-	rm -rf dist/komutracker/pytz
+# Had to be removed due to otherwise causing the error:
+#   aw-qt: symbol lookup error: /opt/activitywatch/libQt5XcbQpa.so.5: undefined symbol: FT_Get_Font_Format
+	rm -f dist/activitywatch/libfontconfig.so.1
+	rm -f dist/activitywatch/libfreetype.so.6
+# Remove unnecessary files
+	rm -rf dist/activitywatch/pytz
 # Builds zips and setups
 	bash scripts/package/package-all.sh
 
@@ -169,11 +182,9 @@ clean:
 
 # Clean all subprojects
 clean_all: clean
-	make --directory=aw-client clean
-	make --directory=aw-core clean
-	make --directory=aw-qt clean
-	make --directory=aw-watcher-afk clean
-	make --directory=aw-watcher-window clean
+	for dir in $(SUBMODULES); do \
+		make --directory=$$dir clean; \
+	done
 
 clean-auto:
 	rm -rIv **/aw-server-rust/target
